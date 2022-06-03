@@ -2,7 +2,6 @@
 # Modified by Bowen Cheng from: https://github.com/facebookresearch/detr/blob/master/models/transformer.py
 """
 Transformer class.
-
 Copy-paste from torch.nn.Transformer with modifications:
     * positional encodings are passed in MHattention
     * extra LN at the end of encoder is removed
@@ -15,19 +14,16 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-class MLP(nn.Module):
-    """ Very simple multi-layer perceptron (also called FFN)"""
-
-    def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
-        super().__init__()
-        self.num_layers = num_layers
-        h = [hidden_dim] * (num_layers - 1)
-        self.layers = nn.ModuleList(nn.Linear(n, k) for n, k in zip([input_dim] + h, h + [output_dim]))
+class depthwise_separable_conv(nn.Module):
+    def __init__(self, nin, kernels_per_layer, nout):
+        super(depthwise_separable_conv, self).__init__()
+        self.depthwise = nn.Conv2d(nin, nin * kernels_per_layer, kernel_size=3, padding=1, groups=nin)
+        self.pointwise = nn.Conv2d(nin * kernels_per_layer, nout, kernel_size=1)
 
     def forward(self, x):
-        for i, layer in enumerate(self.layers):
-            x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
-        return x
+        out = self.depthwise(x)
+        out = self.pointwise(out)
+        return out
 
 class Transformer(nn.Module):
     def __init__(
@@ -59,7 +55,6 @@ class Transformer(nn.Module):
             num_decoder_layers,
             decoder_norm,
             return_intermediate=return_intermediate_dec,
-
         )
 
         self._reset_parameters()
@@ -72,20 +67,22 @@ class Transformer(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def forward(self, src, mask, query_embed, pos_embed):
+    def forward(self, src, mask, query_embed, pos_embed, pos_embed2):
         # flatten NxCxHxW to HWxNxC
+        # src ==> image feature
         bs, c, h, w = src.shape
-
         src = src.flatten(2).permute(2, 0, 1)
         pos_embed = pos_embed.flatten(2).permute(2, 0, 1)
+        pos_embed2 = pos_embed2.flatten(2).permute(2,0,1)
         query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)
+        # src => HW * N * C pos_embed => HW*N*C query_embed = Q * N * C
         if mask is not None:
             mask = mask.flatten(1)
-
         tgt = torch.zeros_like(query_embed)
         memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)
+        # memory.shape = HW * N * C
         hs = self.decoder(
-            tgt, memory, memory_key_padding_mask=mask, pos=pos_embed, query_pos=query_embed,h=h,w=w
+            tgt, memory, memory_key_padding_mask=mask, pos=pos_embed,pos2=pos_embed2, query_pos=query_embed,h=h, w=w
         )
         return hs.transpose(1, 2), memory.permute(1, 2, 0).view(bs, c, h, w)
 
@@ -96,7 +93,7 @@ class TransformerEncoder(nn.Module):
         self.layers = _get_clones(encoder_layer, num_layers)
         self.num_layers = num_layers
         self.norm = norm
-
+        print(self.num_layers)
     def forward(
         self,
         src,
@@ -118,31 +115,13 @@ class TransformerEncoder(nn.Module):
 
 
 class TransformerDecoder(nn.Module):
-
-    def __init__(self, decoder_layer, num_layers,norm=None, return_intermediate=False):
+    def __init__(self, decoder_layer, num_layers, norm=None, return_intermediate=False):
         super().__init__()
         self.layers = _get_clones(decoder_layer, num_layers)
         self.num_layers = num_layers
         self.norm = norm
         self.return_intermediate = return_intermediate
-        self.decoder_norm  = nn.LayerNorm(256)
-        self.mask_embed = MLP(256, 256, 256 ,3)
-
-    def forward_prediction_heads(self, output, mask_features, attn_mask_target_size):
-        decoder_output = self.decoder_norm(output)
-        decoder_output = decoder_output.transpose(0, 1)
-        mask_embed = self.mask_embed(decoder_output)
-
-        outputs_mask = torch.einsum("bqc,bchw->bqhw", mask_embed, mask_features)
-        # NOTE: prediction is of higher-resolution
-        # [B, Q, H, W] -> [B, Q, H*W] -> [B, h, Q, H*W] -> [B*h, Q, HW]
-        attn_mask = F.interpolate(outputs_mask, size=attn_mask_target_size, mode="bilinear", align_corners=False)
-        # must use bool type
-        # If a BoolTensor is provided, positions with ``True`` are not allowed to attend while ``False`` values will be unchanged.
-        attn_mask = (attn_mask.sigmoid().flatten(2).unsqueeze(1).repeat(1, 8, 1, 1).flatten(0, 1) < 0.5).bool()
-        attn_mask = attn_mask.detach()
-
-        return outputs_mask, attn_mask
+        self.depth_wise_conv = depthwise_separable_conv(256,256 * 2,128)
 
     def forward(
         self,
@@ -155,31 +134,40 @@ class TransformerDecoder(nn.Module):
         tgt_key_padding_mask: Optional[Tensor] = None,
         memory_key_padding_mask: Optional[Tensor] = None,
         pos: Optional[Tensor] = None,
+        pos2 : Optional[Tensor] = None,
         query_pos: Optional[Tensor] = None,
     ):
         output = tgt
 
-        mask_features = memory.permute(1,0,2)
-        mask_features = mask_features.reshape(-1,mask_features.shape[-1],h,w)
-        _, cross_attn_mask = self.forward_prediction_heads(output, mask_features, mask_features.shape[-2:])
-
         intermediate = []
-
+        v_memory = memory
         for layer in self.layers:
-            cross_attn_mask[torch.where(cross_attn_mask.sum(-1) == cross_attn_mask.shape[-1])] = False
+            print('memoryshape')
+            print(memory.shape)
+            memory = memory.reshape(-1,memory.shape[-1],h,w)
+
+            memorys = self.depth_wise_conv(memory)
+
+            memory = memorys.flatten(2).permute(2, 0, 1)
+            memorys = memorys.flatten(2).permute(2, 0, 1)
+            # q = Q * N * C memory = HW * N * C value = HW * N * C / 2
             output = layer(
                 output,
                 memory,
+                memorys,
                 tgt_mask=tgt_mask,
                 memory_mask=memory_mask,
                 tgt_key_padding_mask=tgt_key_padding_mask,
                 memory_key_padding_mask=memory_key_padding_mask,
                 pos=pos,
+                pos2 = pos2,
                 query_pos=query_pos,
-                cross_attn_mask=cross_attn_mask
             )
+            print('outputshape')
+            print(output.shape)
             if self.return_intermediate:
                 intermediate.append(self.norm(output))
+            memory = v_memory
 
         if self.norm is not None:
             output = self.norm(output)
@@ -280,8 +268,9 @@ class TransformerDecoderLayer(nn.Module):
         normalize_before=False,
     ):
         super().__init__()
+
         self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
-        self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        self.multihead_attn = nn.MultiheadAttention(d_model , nhead,kdim=d_model//2,vdim=d_model//2,  dropout=dropout)
         # Implementation of Feedforward model
         self.linear1 = nn.Linear(d_model, dim_feedforward)
         self.dropout = nn.Dropout(dropout)
@@ -304,13 +293,14 @@ class TransformerDecoderLayer(nn.Module):
         self,
         tgt,
         memory,
+        memorys,
         tgt_mask: Optional[Tensor] = None,
         memory_mask: Optional[Tensor] = None,
         tgt_key_padding_mask: Optional[Tensor] = None,
         memory_key_padding_mask: Optional[Tensor] = None,
         pos: Optional[Tensor] = None,
+        pos2: Optional[Tensor] = None,
         query_pos: Optional[Tensor] = None,
-        cross_attn_mask : Optional[Tensor] = None,
     ):
         q = k = self.with_pos_embed(tgt, query_pos)
         tgt2 = self.self_attn(
@@ -320,16 +310,20 @@ class TransformerDecoderLayer(nn.Module):
         tgt = self.norm1(tgt)
         tgt2 = self.multihead_attn(
             query=self.with_pos_embed(tgt, query_pos),
-            key=self.with_pos_embed(memory, pos),
-            value=memory,
-            attn_mask=cross_attn_mask,
+            key=self.with_pos_embed(memory, pos2),
+            value=memorys,
+            attn_mask=memory_mask,
             key_padding_mask=memory_key_padding_mask,
         )[0]
+
         tgt = tgt + self.dropout2(tgt2)
         tgt = self.norm2(tgt)
         tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
         tgt = tgt + self.dropout3(tgt2)
         tgt = self.norm3(tgt)
+        print(1)
+        print(tgt2.shape)
+        print(2)
         return tgt
 
     def forward_pre(
@@ -341,19 +335,19 @@ class TransformerDecoderLayer(nn.Module):
         tgt_key_padding_mask: Optional[Tensor] = None,
         memory_key_padding_mask: Optional[Tensor] = None,
         pos: Optional[Tensor] = None,
+        pos2 : Optional[Tensor] = None,
         query_pos: Optional[Tensor] = None,
-        cross_attn_mask: Optional[Tensor] = None,
     ):
         tgt2 = self.norm1(tgt)
         q = k = self.with_pos_embed(tgt2, query_pos)
         tgt2 = self.self_attn(
-            q, k, value=tgt2, attn_mask=cross_attn_mask, key_padding_mask=tgt_key_padding_mask
+            q, k, value=tgt2, attn_mask=tgt_mask, key_padding_mask=tgt_key_padding_mask
         )[0]
         tgt = tgt + self.dropout1(tgt2)
         tgt2 = self.norm2(tgt)
         tgt2 = self.multihead_attn(
             query=self.with_pos_embed(tgt2, query_pos),
-            key=self.with_pos_embed(memory, pos),
+            key=self.with_pos_embed(memory, pos2),
             value=memory,
             attn_mask=memory_mask,
             key_padding_mask=memory_key_padding_mask,
@@ -368,36 +362,39 @@ class TransformerDecoderLayer(nn.Module):
         self,
         tgt,
         memory,
+        memorys,
         tgt_mask: Optional[Tensor] = None,
         memory_mask: Optional[Tensor] = None,
         tgt_key_padding_mask: Optional[Tensor] = None,
         memory_key_padding_mask: Optional[Tensor] = None,
         pos: Optional[Tensor] = None,
+        pos2: Optional[Tensor] = None,
         query_pos: Optional[Tensor] = None,
-        cross_attn_mask: Optional[Tensor] = None,
     ):
         if self.normalize_before:
             return self.forward_pre(
                 tgt,
                 memory,
+                memorys,
                 tgt_mask,
                 memory_mask,
                 tgt_key_padding_mask,
                 memory_key_padding_mask,
                 pos,
+                pos2,
                 query_pos,
-                cross_attn_mask
             )
         return self.forward_post(
             tgt,
             memory,
+            memorys,
             tgt_mask,
             memory_mask,
             tgt_key_padding_mask,
             memory_key_padding_mask,
             pos,
+            pos2,
             query_pos,
-            cross_attn_mask
         )
 
 
